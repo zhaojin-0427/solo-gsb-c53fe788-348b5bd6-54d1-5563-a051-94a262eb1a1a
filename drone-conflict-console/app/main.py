@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -115,9 +116,15 @@ def get_scenario(sid: int):
     H = row["safety_height"]
     pcs = build_pair_constraints(sorties, R, H)
     earliest = scan_schedule(sorties, {s.id: 0 for s in sorties}, R, H)
-    return _scenario_summary(sid, sorties, R, H, pcs,
-                             solve_result=row["result"],
-                             earliest_conflicts=earliest)
+    out = _scenario_summary(sid, sorties, R, H, pcs,
+                            solve_result=row["result"],
+                            earliest_conflicts=earliest)
+    if row.get("unverified") is not None:
+        # The latest solve came back unknown and the stored table is the
+        # retained OLD one; expose the persisted marker so a (reloaded) page
+        # and direct API clients apply the same batch-creation adjudication.
+        out["unverified"] = row["unverified"]
+    return out
 
 
 @app.delete("/api/scenarios/{sid}")
@@ -168,8 +175,12 @@ def solve_scenario(sid: int, req: SolveRequest):
     # thresholds it was solved under.  The page therefore keeps the new
     # locks/thresholds, marks the old table's original constraints, and only
     # offers batch creation as an explicit "use the stored old table" choice.
-    # A genuine infeasibility proof still replaces the stored result, and "no
-    # prior solution" leaves the unknown status visible to the page/API.
+    # The unknown run is also PERSISTED as an ``unverified`` marker: until a
+    # later solve stores a definitive verdict, the batch route rejects any
+    # creation that does not explicitly select the retained old table and
+    # confirm its original thresholds.  A genuine infeasibility proof still
+    # replaces the stored result (clearing the marker), and "no prior
+    # solution" leaves the unknown status visible to the page/API.
     prior = row.get("result")
     keep_prior = res.status == "unknown" and bool(prior and prior.get("feasible"))
 
@@ -195,9 +206,21 @@ def solve_scenario(sid: int, req: SolveRequest):
         # SQLite keeps the previously proven table untouched; the response
         # still reports this run as unknown and carries the retained table
         # (annotated with its original thresholds) under a separate key.
+        # Persist the "latest solve unverified" marker so the batch route
+        # (and a reloaded page, via GET) can tell this state apart from a
+        # normal feasible one until a definitive re-solve clears it.
+        marker = store.set_unverified(sid, {
+            "status": "unknown",
+            "requested_safety_radius": R,
+            "requested_safety_height": H,
+            "locks": dict(locks),
+        })
         effective_result = result
     else:
-        store.save_result(sid, result, R, H)
+        # A definitive verdict (feasible / infeasible) — or an unknown with
+        # no retained table to protect — replaces the stored result and
+        # lifts any stale unverified marker in the same transaction.
+        store.save_result(sid, result, R, H, clear_unverified=True)
         effective_result = result
     out = _scenario_summary(sid, sorties, R, H, pcs,
                             solve_result=effective_result,
@@ -208,6 +231,7 @@ def solve_scenario(sid: int, req: SolveRequest):
             "safety_radius": row["safety_radius"],
             "safety_height": row["safety_height"],
         }
+        out["unverified"] = marker
     return out
 
 
@@ -216,6 +240,9 @@ def save_scenario(sid: int, req: SaveRequest):
     sorties, row, payload = _load(sid)
     if row["result"] is None:
         raise HTTPException(400, "solve the scenario before saving a plan")
+    # Renaming/saving the retained old table must NOT lift the unverified
+    # marker: only a fresh solve verdict may clear it, so clear_unverified
+    # stays False here.
     store.save_result(sid, row["result"], row["safety_radius"], row["safety_height"],
                       name=req.name)
     return {"scenario_id": sid, "name": req.name, "saved": True}
@@ -262,13 +289,55 @@ def create_batch(sid: int, req: CreateBatchRequest):
     if result is None or not result.get("feasible"):
         raise HTTPException(
             400, "a feasible plan must be solved before creating an execution batch")
+    unverified = row.get("unverified")
+    if unverified is not None:
+        # The latest solve returned ``unknown``: the stored table is a
+        # retained OLD table whose (new) locks/thresholds were never
+        # verified.  This is NOT a normal feasible state — freezing the old
+        # table into a batch is allowed only as an explicit old-table
+        # selection (``use_stored_plan``) that also confirms the old table's
+        # original thresholds, and those confirmed values must match what
+        # SQLite actually holds.  Anything else is rejected and creates
+        # nothing; page and direct API callers get the same adjudication.
+        if not req.use_stored_plan:
+            raise HTTPException(409, detail={
+                "reason": "unverified_solve_pending",
+                "message": "the latest solve returned unknown; the stored "
+                           "table is a retained old table under its original "
+                           "thresholds. Re-solve to a definitive verdict, or "
+                           "explicitly select the old table with "
+                           "use_stored_plan=true and confirm its original "
+                           "safety_radius/safety_height.",
+                "stored_safety_radius": row["safety_radius"],
+                "stored_safety_height": row["safety_height"],
+            })
+        if req.safety_radius is None or req.safety_height is None:
+            raise HTTPException(409, detail={
+                "reason": "stored_plan_thresholds_unconfirmed",
+                "message": "selecting the retained old table requires "
+                           "confirming its original safety_radius and "
+                           "safety_height in the request.",
+                "stored_safety_radius": row["safety_radius"],
+                "stored_safety_height": row["safety_height"],
+            })
+        if not (math.isclose(req.safety_radius, row["safety_radius"],
+                             rel_tol=1e-9, abs_tol=1e-12)
+                and math.isclose(req.safety_height, row["safety_height"],
+                                 rel_tol=1e-9, abs_tol=1e-12)):
+            raise HTTPException(409, detail={
+                "reason": "stored_plan_threshold_mismatch",
+                "message": "the confirmed thresholds do not match the "
+                           "retained old table stored in SQLite.",
+                "stored_safety_radius": row["safety_radius"],
+                "stored_safety_height": row["safety_height"],
+                "received_safety_radius": req.safety_radius,
+                "received_safety_height": req.safety_height,
+            })
     # Freeze the input snapshot, safety thresholds and planned offsets; later
-    # re-solves of the scenario never mutate this batch.  The batch always
-    # freezes the plan stored in SQLite; ``req.use_stored_plan`` is the
-    # client's explicit acknowledgment that it is deliberately selecting that
-    # stored (old) table with its original thresholds after a re-solve came
-    # back ``unknown`` (the page labels the action accordingly).  Behaviour is
-    # otherwise identical either way, keeping existing clients compatible.
+    # re-solves of the scenario never mutate this batch.  With no unverified
+    # marker pending this is the normal feasible path and freezes the freshly
+    # verified table; with the marker it is the confirmed old-table selection
+    # above and freezes the retained old input/thresholds/offsets.
     plan = {"offsets": dict(result["offsets"])}
     bid = store.create_batch(
         sid, req.name, row["input"], row["safety_radius"], row["safety_height"], plan)

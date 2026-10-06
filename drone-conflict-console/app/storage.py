@@ -2,7 +2,11 @@
 
 A *scenario* keeps the exact imported JSON (input snapshot) together with the
 safety parameters used for the most recent solve, so saved plans can always be
-reopened and compared against their original input.
+reopened and compared against their original input.  When the latest solve
+returned ``unknown`` while a feasible old table is retained, the scenario also
+carries an ``unverified_json`` marker (the requested new thresholds/locks);
+the batch route uses it to tell "latest solve unverified" apart from a normal
+feasible state until a definitive re-solve clears it.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ CREATE TABLE IF NOT EXISTS scenarios (
     safety_height   REAL NOT NULL,
     created_at      REAL NOT NULL,
     solved_at       REAL,
-    result_json     TEXT
+    result_json     TEXT,
+    unverified_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -103,6 +108,7 @@ class Store:
                     c.execute("PRAGMA journal_mode=WAL")
                     c.execute("PRAGMA synchronous=NORMAL")
                     c.executescript(_SCHEMA)
+                    self._migrate(c)
                     break
                 except sqlite3.OperationalError as exc:
                     if "locked" not in str(exc) or attempt == _BUSY_ATTEMPTS - 1:
@@ -113,6 +119,18 @@ class Store:
         # the newest state knowable at upgrade time - earlier history is never
         # fabricated.  Idempotent and serialized via the write transaction.
         self._backfill_baselines()
+
+    @staticmethod
+    def _migrate(c) -> None:
+        """Add columns introduced after the first release, idempotently.
+
+        ``unverified_json`` records the "latest solve returned unknown while
+        a feasible old table is retained" marker; databases written by older
+        releases simply have no pending marker after the upgrade.
+        """
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(scenarios)")}
+        if "unverified_json" not in cols:
+            c.execute("ALTER TABLE scenarios ADD COLUMN unverified_json TEXT")
 
     @staticmethod
     def _snapshot(c, batch_id: int) -> str:
@@ -188,16 +206,45 @@ class Store:
             return int(cur.lastrowid)
 
     def save_result(self, scenario_id: int, result: dict, safety_radius: float,
-                    safety_height: float, name: str | None = None) -> None:
+                    safety_height: float, name: str | None = None,
+                    clear_unverified: bool = False) -> None:
         with self._write_tx() as c:
             if name is not None:
                 c.execute("UPDATE scenarios SET name=? WHERE id=?", (name, scenario_id))
+            # A fresh solve verdict replaces the stored result.  Renaming a
+            # plan (name=... alone) must NOT lift the unverified marker, so
+            # the marker is cleared only when the caller passes
+            # ``clear_unverified`` — i.e. a solve run that produced a
+            # definitive stored result — and in the same transaction, so the
+            # database can never hold "new table + stale marker".
+            sql = ("UPDATE scenarios SET result_json=?, solved_at=?,"
+                   " safety_radius=?, safety_height=?"
+                   + (", unverified_json=NULL" if clear_unverified else "")
+                   + " WHERE id=?")
             c.execute(
-                "UPDATE scenarios SET result_json=?, solved_at=?, safety_radius=?, safety_height=?"
-                " WHERE id=?",
+                sql,
                 (json.dumps(result, ensure_ascii=False), time.time(),
                  float(safety_radius), float(safety_height), scenario_id),
             )
+
+    def set_unverified(self, scenario_id: int, info: dict) -> dict:
+        """Record that the latest solve returned ``unknown`` while a feasible
+        old table is retained in ``result_json``.
+
+        The marker (the requested new thresholds/locks plus ``recorded_at``)
+        is what later distinguishes "latest solve unverified" from a normal
+        feasible state; it survives restarts and is cleared only by a solve
+        that stores a definitive result (``save_result(...,
+        clear_unverified=True)``) or by deleting the scenario.  Returns the
+        stored marker.
+        """
+        marker = {**info, "recorded_at": time.time()}
+        with self._write_tx() as c:
+            c.execute(
+                "UPDATE scenarios SET unverified_json=? WHERE id=?",
+                (json.dumps(marker, ensure_ascii=False), scenario_id),
+            )
+        return marker
 
     def list_scenarios(self) -> list[dict]:
         with self._conn() as c:
@@ -216,6 +263,8 @@ class Store:
         d = dict(row)
         d["input"] = json.loads(d.pop("input_json"))
         d["result"] = json.loads(d["result_json"]) if d.get("result_json") else None
+        d["unverified"] = (json.loads(d["unverified_json"])
+                           if d.get("unverified_json") else None)
         return d
 
     def delete_scenario(self, scenario_id: int) -> bool:

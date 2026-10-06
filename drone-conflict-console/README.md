@@ -43,12 +43,19 @@
   **响应如实报告 `unknown`**：顶层阈值/约束是本次送入的新值，`solution` 即本次的
   `unknown` 结果；SQLite 中已存的可行旧表**不会被覆盖**，并作为 `prior_solution`
   （附旧表求解时的**原阈值**）随响应回带——旧表仍可查看，但不会被当成“本次求解成功”。
-  页面保留本次锁定与阈值输入，地图/时间轴继续画出旧表并标明“旧表 · 原阈值”；
-  此时创建执行批次只能**显式选用旧表及原阈值**（按钮与确认框均标明，请求带
-  `use_stored_plan: true`）。没有旧表时响应就是单纯的 `unknown`；证明了
-  `infeasible` 的重算仍会替换旧结果；新的可行解照常保存。
+  页面保留本次锁定与阈值输入，地图/时间轴继续画出旧表并标明“旧表 · 原阈值”。
+  同时这次 `unknown` 会作为 **`unverified` 标记持久化进 SQLite**（记录本次请求的
+  新阈值与锁定，`GET /api/scenarios/{id}` 同步暴露，重启不丢）：标记在位期间，
+  创建执行批次**只能显式选用旧表及原阈值**——请求必须带 `use_stored_plan: true`
+  **并且确认的原阈值与库中旧表一致**，否则一律 `409` 拒绝且不建批次（省略
+  `use_stored_plan` 或传 `false` 同样拒绝）；改名保存旧表**不会**解除该限制。
+  只有新的可行解（或确证 `infeasible`）落库才清除标记、恢复无标记创建；
+  没有旧表时响应就是单纯的 `unknown`，批次创建依旧因“无可行方案”被拒绝。
 - **执行批次与偏差预警**：从已保存的可行方案创建**执行批次**，冻结输入航迹快照、
-  安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。各架次以**非负整数秒
+  安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。若最近一次重算为
+  `unknown`（`unverified` 标记在位），批次路由把“未验证”与正常可行严格区分：
+  只有显式选用旧表且确认的原阈值与库中一致才冻结，否则 `409` 拒绝且不建批次
+  （页面与直连 API 同一裁决）。各架次以**非负整数秒
   实际起飞偏移 + 修订号**（首版 1、严格递增）上报；同号同值重试幂等，同号异值或
   旧号返回冲突。上报裁决在存储层用**数据库级条件写入**完成，**多个进程共用同一
   SQLite 文件并发上报时也不会发生修订回退**：高修订号先提交则低号得到带
@@ -131,7 +138,9 @@ docker compose up --build
   超时返回 `unknown`，结果面板如实显示 `unknown` 并列出 **已保留的旧表
   （原阈值 R/H）**，阈值输入与锁定保持本次新值，**执行批次**卡片的按钮变为
   **“选用已保存旧表创建批次（原阈值…）”**——显式确认后才用旧表及原阈值
-  冻结批次。
+  冻结批次（请求带 `use_stored_plan: true` 及确认的原阈值；服务端对直连
+  API 执行同一裁决，标记未清除前缺少确认或阈值不符一律 `409` 不建批次）。
+  刷新页面后该状态由 `GET` 返回的 `unverified` 标记恢复，裁决不变。
 - **批次页（含临时作业区开工窗口查询）**：<http://localhost:8000/>
   → 打开任意执行批次（或先从可行方案创建批次），在批次详情的
   **临时作业区开工窗口** 卡片填写圆柱参数、截止秒 `T` 与作业时长 `d`
@@ -154,10 +163,21 @@ curl -s -X POST http://localhost:8000/api/scenarios/1/solve \
   -d '{"time_limit":0.0001,"safety_radius":45,"safety_height":12,
        "locks":[{"sortie_id":"UAV-B","offset":5}]}'
 # => solution.status "unknown"（本次新阈值 45/12 与锁定如实回显，顶层阈值即新值）；
-#    prior_solution 携带旧表 offsets 与原阈值 30/10；SQLite 旧表未被覆盖
+#    prior_solution 携带旧表 offsets 与原阈值 30/10；SQLite 旧表未被覆盖，
+#    且 unverified 标记已落库（GET /api/scenarios/1 可见，重启仍在）
+curl -s -X POST http://localhost:8000/api/scenarios/1/batches \
+  -H 'Content-Type: application/json' -d '{"name":"绕过"}'
+# => 409 {"detail":{"reason":"unverified_solve_pending", ...}}
+#    最近一次求解未验证：省略 use_stored_plan（或传 false）一律拒绝，不建批次
 curl -s -X POST http://localhost:8000/api/scenarios/1/batches \
   -H 'Content-Type: application/json' -d '{"name":"旧表批次","use_stored_plan":true}'
-# => 显式选用旧表：planned_offsets 仍为 {4,0,2,6}，冻结阈值 30/10
+# => 409 {"detail":{"reason":"stored_plan_thresholds_unconfirmed", ...}}
+#    显式选用旧表还必须确认其原阈值（与库中旧表不一致时reason为
+#    stored_plan_threshold_mismatch，同样 409 不建批次）
+curl -s -X POST http://localhost:8000/api/scenarios/1/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"旧表批次","use_stored_plan":true,"safety_radius":30,"safety_height":10}'
+# => 201 显式选用旧表并确认原阈值：planned_offsets 仍为 {4,0,2,6}，冻结阈值 30/10
 ```
 
 数据保存在 Docker 命名卷 `dcc-data`（容器内 `/data/console.db`），
@@ -240,7 +260,10 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
    （输入航迹、安全阈值、计划偏移随即冻结）。若上一次重算为 `unknown`，
    该按钮变为 **“选用已保存旧表创建批次（原阈值 R/H）”**：点击后需确认，
    即**显式选用** SQLite 中保留的旧表及其原阈值冻结批次（请求带
-   `use_stored_plan: true`），不会把未经验证的新约束当作已验证。在批次详情中：
+   `use_stored_plan: true` 与确认的原阈值 `safety_radius`/`safety_height`，
+   二者须与库中旧表一致），不会把未经验证的新约束当作已验证；刷新页面后
+   该状态仍在（`unverified` 标记存于 SQLite），改名保存旧表也不会解除限制，
+   只有重算出新的可行解（或确证无解）才清除标记。在批次详情中：
    - 每个架次一行，填写**非负整数秒实际起飞偏移**后点 **上报**，修订号自动取
      “当前 +1”（首版为 1）；同号同值重发安全（幂等），同号异值 / 旧号会弹冲突提示。
    - 填写 **当前秒 t**，点 **评估预警**：状态徽标显示“已上报 / 按计划 / 逾期”，
@@ -327,10 +350,17 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
     但响应**不再把旧表回填为本次结果**——`solution` 如实是本次的 `unknown`
     （顶层安全阈值/互斥时差也是本次请求送入的新值），旧表改由独立的
     `prior_solution` 字段承载并附**旧表原阈值**，页面据此继续展示旧表、保留本次
-    锁定与阈值输入，且把“创建批次”变为**显式选用旧表及原阈值**的动作
-    （`POST /api/scenarios/{id}/batches` 可带 `use_stored_plan: true` 表明这一选择；
-    不带时行为与以往完全一致）。没有已存可行方案时响应就是单纯的 `unknown`；
-    证明了 `infeasible` 的重算仍会正常覆盖旧结果；已冻结的批次不受任何重算影响。
+    锁定与阈值输入。同时该次 `unknown` 以 **`unverified` 标记持久化**
+    （记录请求的新阈值/锁定，`GET /api/scenarios/{id}` 可见，重启不丢）；
+    标记在位期间 `POST /api/scenarios/{id}/batches` 把“最近一次求解未验证”与
+    正常可行严格区分：**只有**显式选用旧表（`use_stored_plan: true`）**且**请求
+    确认的原阈值与库中旧表一致，才冻结旧输入/阈值/偏移（`201`）；省略
+    `use_stored_plan`、传 `false`、未确认阈值或阈值不符一律 `409` 且不建批次
+    （`reason` 分别为 `unverified_solve_pending` /
+    `stored_plan_thresholds_unconfirmed` / `stored_plan_threshold_mismatch`）。
+    改名保存旧表**不会**清除标记；新的可行解落库才恢复无标记创建；
+    证明了 `infeasible` 的重算仍会正常覆盖旧结果（并清除标记）；
+    已冻结的批次不受任何重算影响。
 
 ---
 
@@ -339,12 +369,12 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | `POST` | `/api/import` | 导入航迹 JSON，返回架次/互斥时差/最早起飞冲突 |
-| `POST` | `/api/scenarios/{id}/solve` | 按（可覆盖的）安全参数与锁定重算；`unknown` 且有旧表时旧表经 `prior_solution`（附原阈值）回带，`solution` 如实为 `unknown` |
-| `POST` | `/api/scenarios/{id}/save` | 命名保存当前方案（含输入快照） |
+| `POST` | `/api/scenarios/{id}/solve` | 按（可覆盖的）安全参数与锁定重算；`unknown` 且有旧表时旧表经 `prior_solution`（附原阈值）回带，`solution` 如实为 `unknown`，并持久化 `unverified` 标记 |
+| `POST` | `/api/scenarios/{id}/save` | 命名保存当前方案（含输入快照；改名保存旧表不会清除 `unverified` 标记） |
 | `GET` | `/api/scenarios` | 已保存方案列表 |
-| `GET` | `/api/scenarios/{id}` | 回看某个方案（输入快照 + 求解结果） |
+| `GET` | `/api/scenarios/{id}` | 回看某个方案（输入快照 + 求解结果；有未验证重算时附 `unverified` 标记） |
 | `DELETE` | `/api/scenarios/{id}` | 删除 |
-| `POST` | `/api/scenarios/{id}/batches` | 从可行方案创建执行批次（冻结快照/阈值/计划；可带 `use_stored_plan: true` 显式选用已存旧表及原阈值） |
+| `POST` | `/api/scenarios/{id}/batches` | 从可行方案创建执行批次（冻结快照/阈值/计划）；若最近一次求解为 `unknown`，必须带 `use_stored_plan: true` 且确认的原阈值 `safety_radius`/`safety_height` 与库中旧表一致，否则 `409` 不建批次 |
 | `GET` | `/api/batches?scenario_id=` | 批次列表（可按场景过滤） |
 | `GET` | `/api/batches/{id}` | 批次详情（冻结计划 + 全部上报） |
 | `DELETE` | `/api/batches/{id}` | 删除批次及其上报 |

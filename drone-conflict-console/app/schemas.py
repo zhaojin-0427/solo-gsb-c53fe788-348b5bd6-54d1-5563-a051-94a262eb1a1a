@@ -76,11 +76,23 @@ class CreateBatchRequest(BaseModel):
     name: str = Field("", description="optional display name for the batch")
     use_stored_plan: bool = Field(
         False,
-        description="explicit acknowledgment that the batch freezes the plan "
-                    "currently stored in SQLite (the retained old table with "
-                    "its original thresholds) rather than a freshly verified "
-                    "solve; sent by the page when the latest re-solve returned "
-                    "unknown and the user deliberately selects the old table",
+        description="explicit selection of the plan currently stored in "
+                    "SQLite (the retained old table with its original "
+                    "thresholds); required once the latest re-solve returned "
+                    "unknown, because the new locks/thresholds were never "
+                    "verified",
+    )
+    safety_radius: float | None = Field(
+        None, gt=0,
+        description="confirmation of the stored old table's original safety "
+                    "radius; while the latest solve is unverified this must "
+                    "be sent and must match the value stored in SQLite",
+    )
+    safety_height: float | None = Field(
+        None, gt=0,
+        description="confirmation of the stored old table's original safety "
+                    "height; while the latest solve is unverified this must "
+                    "be sent and must match the value stored in SQLite",
     )
 
 

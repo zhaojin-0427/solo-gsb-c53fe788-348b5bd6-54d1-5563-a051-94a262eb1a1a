@@ -14,6 +14,7 @@ const state = {
   earliestConflicts: [],
   solution: null,        // THIS run's solve result (may be status "unknown")
   priorSolution: null,   // retained old table (original thresholds) after an unknown re-solve
+  unverified: null,      // persisted "latest solve unknown" marker (requested thresholds/locks)
   history: [],
   locks: {},             // sortieId -> offset (only when checked)
   time: 0,
@@ -80,6 +81,28 @@ function loadScenarioDto(dto) {
   state.earliestConflicts = dto.earliest_conflicts || [];
   state.solution = dto.solution || null;
   state.priorSolution = dto.prior_solution || null;
+  state.unverified = dto.unverified || null;
+  if (!state.priorSolution && state.unverified &&
+      state.solution && state.solution.feasible) {
+    // GET on a scenario whose latest re-solve is unverified: the stored table
+    // IS the retained old table.  Present exactly the same state as the
+    // unknown-solve response, so the page and the HTTP API apply the same
+    // batch-creation adjudication even after a reload.
+    state.priorSolution = {
+      ...state.solution,
+      safety_radius: dto.safety_radius,
+      safety_height: dto.safety_height,
+    };
+    state.solution = {
+      feasible: false,
+      status: "unknown",
+      offsets: {},
+      locked: state.unverified.locks || {},
+      weighted_delay: null,
+      solved_conflicts: [],
+      elapsed_seconds: null,
+    };
+  }
   // Keep the locks this run actually applied (they stay checked after a
   // re-solve — in particular after an unknown one — instead of vanishing).
   state.locks = { ...((state.solution && state.solution.locked) || {}) };
@@ -92,9 +115,12 @@ function loadScenarioDto(dto) {
   state.workzone = null;
   state.sorties.forEach((s) => colorFor(s.id));
   // The solve response echoes THIS run's thresholds, so the inputs keep the
-  // values just requested even when the run timed out (unknown).
-  $("safetyRadius").value = dto.safety_radius;
-  $("safetyHeight").value = dto.safety_height;
+  // values just requested even when the run timed out (unknown); after a
+  // reload the persisted marker supplies those same unverified values.
+  $("safetyRadius").value = state.unverified
+    ? state.unverified.requested_safety_radius : dto.safety_radius;
+  $("safetyHeight").value = state.unverified
+    ? state.unverified.requested_safety_height : dto.safety_height;
   $("newSolveBtn").disabled = false;
   updateCreateBatchBtn();
   $("savePlanBtn").disabled = !(state.solution && state.solution.feasible);
@@ -330,11 +356,17 @@ function renderResultPanel() {
     title.textContent = "⏳ 本次求解超时 — 可行与无解均未证明（unknown）";
     const prior = state.priorSolution && state.priorSolution.feasible
       ? state.priorSolution : null;
+    // The unverified run's own thresholds: echoed at top level by the solve
+    // response, or carried by the persisted marker when reloaded via GET.
+    const pendR = state.unverified
+      ? state.unverified.requested_safety_radius : state.scenario.safety_radius;
+    const pendH = state.unverified
+      ? state.unverified.requested_safety_height : state.scenario.safety_height;
     let html = `
       <div class="kv bad"><span>本次状态</span><b>${sol.status}</b></div>
       <div class="hint" style="margin-top:6px">
         在给定时限内 CP-SAT 既没有找到可行起飞表，也没有证明无解。这与“确实无解”不同：
-        本次送入的锁定与安全阈值（R=${state.scenario.safety_radius}m / H=${state.scenario.safety_height}m）
+        本次送入的锁定与安全阈值（R=${pendR}m / H=${pendH}m）
         <b>未经验证</b>，已保留在左侧输入中，可加大求解时限后点“重算”重试。</div>`;
     if (prior) {
       const seq = Object.keys(prior.offsets).sort()
@@ -757,7 +789,9 @@ async function createBatch() {
   if (!state.scenarioId) return;
   // After an unknown re-solve the only freezable plan is the retained old
   // table; selecting it must be an explicit, informed choice (the new locks/
-  // thresholds were never verified).
+  // thresholds were never verified).  The server enforces the same
+  // adjudication for direct API calls: use_stored_plan plus the old table's
+  // original thresholds, which must match SQLite.
   const prior = usingPriorTable() ? state.priorSolution : null;
   if (prior) {
     const seq = Object.keys(prior.offsets).sort()
@@ -772,10 +806,14 @@ async function createBatch() {
   }
   const name = prompt("为执行批次命名（可留空）：", `批次 #${state.scenarioId}`);
   if (name === null) return;
+  const body = prior
+    ? { name, use_stored_plan: true,
+        safety_radius: prior.safety_radius, safety_height: prior.safety_height }
+    : { name, use_stored_plan: false };
   try {
     const b = await api(`/api/scenarios/${state.scenarioId}/batches`, {
       method: "POST",
-      body: JSON.stringify({ name, use_stored_plan: !!prior }),
+      body: JSON.stringify(body),
     });
     toast(prior
       ? "已用已保存旧表（原阈值）创建执行批次"
