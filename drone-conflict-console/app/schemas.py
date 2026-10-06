@@ -79,8 +79,20 @@ class CreateBatchRequest(BaseModel):
         description="explicit acknowledgment that the batch freezes the plan "
                     "currently stored in SQLite (the retained old table with "
                     "its original thresholds) rather than a freshly verified "
-                    "solve; sent by the page when the latest re-solve returned "
-                    "unknown and the user deliberately selects the old table",
+                    "solve; REQUIRED when the scenario's latest solve returned "
+                    "unknown and a feasible old table is retained",
+    )
+    confirmed_safety_radius: float | None = Field(
+        None, gt=0,
+        description="the old table's original safety radius the client is "
+                    "confirming; required (and must match the stored value) "
+                    "together with use_stored_plan after an unknown solve",
+    )
+    confirmed_safety_height: float | None = Field(
+        None, gt=0,
+        description="the old table's original safety height the client is "
+                    "confirming; required (and must match the stored value) "
+                    "together with use_stored_plan after an unknown solve",
     )
 
 

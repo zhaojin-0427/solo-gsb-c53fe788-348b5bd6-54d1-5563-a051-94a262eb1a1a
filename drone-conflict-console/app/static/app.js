@@ -14,6 +14,7 @@ const state = {
   earliestConflicts: [],
   solution: null,        // THIS run's solve result (may be status "unknown")
   priorSolution: null,   // retained old table (original thresholds) after an unknown re-solve
+  unverifiedSolve: null, // persisted marker: most recent solve was unknown (survives reload)
   history: [],
   locks: {},             // sortieId -> offset (only when checked)
   time: 0,
@@ -80,6 +81,21 @@ function loadScenarioDto(dto) {
   state.earliestConflicts = dto.earliest_conflicts || [];
   state.solution = dto.solution || null;
   state.priorSolution = dto.prior_solution || null;
+  state.unverifiedSolve = dto.unverified_solve || null;
+  // After a page reload the stored result itself is the OLD feasible table,
+  // not the unproven run; synthesise an "unknown" view of the most recent
+  // (persisted) unproven solve so every panel renders exactly like right after
+  // the timed-out POST.
+  if (state.unverifiedSolve && !(state.solution && state.solution.status === "unknown")) {
+    state.solution = {
+      feasible: false,
+      status: "unknown",
+      locked: state.unverifiedSolve.locks || {},
+      weighted_delay: null,
+      offsets: {},
+      solved_conflicts: [],
+    };
+  }
   // Keep the locks this run actually applied (they stay checked after a
   // re-solve — in particular after an unknown one — instead of vanishing).
   state.locks = { ...((state.solution && state.solution.locked) || {}) };
@@ -91,13 +107,21 @@ function loadScenarioDto(dto) {
   state.reviewNodes = [];
   state.workzone = null;
   state.sorties.forEach((s) => colorFor(s.id));
-  // The solve response echoes THIS run's thresholds, so the inputs keep the
-  // values just requested even when the run timed out (unknown).
-  $("safetyRadius").value = dto.safety_radius;
-  $("safetyHeight").value = dto.safety_height;
+  // The inputs show the most recent run's attempted thresholds: the solve
+  // response echoes THIS run's values; after a reload with a persisted unknown
+  // marker those live on unverified_solve (the top level carries the retained
+  // old table's original values).
+  const inputR = state.unverifiedSolve
+    ? state.unverifiedSolve.safety_radius : dto.safety_radius;
+  const inputH = state.unverifiedSolve
+    ? state.unverifiedSolve.safety_height : dto.safety_height;
+  $("safetyRadius").value = inputR;
+  $("safetyHeight").value = inputH;
   $("newSolveBtn").disabled = false;
   updateCreateBatchBtn();
-  $("savePlanBtn").disabled = !(state.solution && state.solution.feasible);
+  // Naming/saving the retained old table stays possible after an unknown run,
+  // but neither it nor the rename clears the persisted unknown marker.
+  $("savePlanBtn").disabled = !displayedSolution();
   updateMaxTime();
   state.time = 0;
   $("timeScrub").value = 0;
@@ -115,9 +139,13 @@ function displayedSolution() {
   return null;
 }
 
+// The retained old table is the only drawable/freezable table exactly when the
+// most recent solve was UNVERIFIED (the persisted unknown marker, also set
+// straight after the timed-out POST) AND a feasible old table is retained.
 function usingPriorTable() {
-  return !(state.solution && state.solution.feasible) &&
-    !!(state.priorSolution && state.priorSolution.feasible);
+  return !!state.unverifiedSolve
+    && !(state.solution && state.solution.feasible)
+    && !!(state.priorSolution && state.priorSolution.feasible);
 }
 
 function updateCreateBatchBtn() {
@@ -328,14 +356,18 @@ function renderResultPanel() {
   panel.classList.remove("hidden");
   if (sol.status === "unknown") {
     title.textContent = "⏳ 本次求解超时 — 可行与无解均未证明（unknown）";
-    const prior = state.priorSolution && state.priorSolution.feasible
-      ? state.priorSolution : null;
+    const prior = usingPriorTable() ? state.priorSolution : null;
+    const att = state.unverifiedSolve || {};
+    const attR = att.safety_radius ?? state.scenario.safety_radius;
+    const attH = att.safety_height ?? state.scenario.safety_height;
     let html = `
       <div class="kv bad"><span>本次状态</span><b>${sol.status}</b></div>
       <div class="hint" style="margin-top:6px">
         在给定时限内 CP-SAT 既没有找到可行起飞表，也没有证明无解。这与“确实无解”不同：
-        本次送入的锁定与安全阈值（R=${state.scenario.safety_radius}m / H=${state.scenario.safety_height}m）
-        <b>未经验证</b>，已保留在左侧输入中，可加大求解时限后点“重算”重试。</div>`;
+        本次送入的锁定与安全阈值（R=${attR}m / H=${attH}m）
+        <b>未经验证</b>，已保留在左侧输入中，可加大求解时限后点“重算”重试。
+        该 unknown 状态已持久记录；改名/保存旧表不会解除批次创建限制，只有重新求解得到
+        可行解（或确证无解）才会改变。</div>`;
     if (prior) {
       const seq = Object.keys(prior.offsets).sort()
         .map((k) => `${escapeHtml(k)}=${prior.offsets[k]}`).join("，");
@@ -773,9 +805,19 @@ async function createBatch() {
   const name = prompt("为执行批次命名（可留空）：", `批次 #${state.scenarioId}`);
   if (name === null) return;
   try {
+    const body = { name };
+    if (prior) {
+      // Explicit, informed selection of the retained old table AND a
+      // server-checked confirmation of the original thresholds it was solved
+      // under; the server rejects anything else (omitted flag / false / a
+      // different threshold) without creating a batch.
+      body.use_stored_plan = true;
+      body.confirmed_safety_radius = prior.safety_radius;
+      body.confirmed_safety_height = prior.safety_height;
+    }
     const b = await api(`/api/scenarios/${state.scenarioId}/batches`, {
       method: "POST",
-      body: JSON.stringify({ name, use_stored_plan: !!prior }),
+      body: JSON.stringify(body),
     });
     toast(prior
       ? "已用已保存旧表（原阈值）创建执行批次"
@@ -783,7 +825,7 @@ async function createBatch() {
     await fetchBatches();
     await openBatch(b.batch_id);
   } catch (e) {
-    toast("创建批次失败：" + e.message, 4000);
+    toast("创建批次被拒绝：" + e.message, 4600);
   }
 }
 

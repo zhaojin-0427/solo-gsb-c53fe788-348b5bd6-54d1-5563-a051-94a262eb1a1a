@@ -33,7 +33,23 @@ CREATE TABLE IF NOT EXISTS scenarios (
     safety_height   REAL NOT NULL,
     created_at      REAL NOT NULL,
     solved_at       REAL,
-    result_json     TEXT
+    result_json     TEXT,
+    -- State of the most recent /solve run, persisted SEPARATELY from the
+    -- retained (old) result row:
+    --   * NULL                     -> the stored result (if any) is the
+    --                                product of the latest verified solve
+    --                                (feasible/infeasible); normal creation;
+    --   * 'unknown'                -> the latest solve proved NOTHING (timed
+    --                                out).  The stored feasible table (kept
+    --                                in result_json) is an unverified OLD
+    --                                table; batches may freeze it only via an
+    --                                explicit, threshold-checked selection.
+    -- ``unverified_solve_json`` remembers that unproven run's attempted
+    -- thresholds/locks so the marker survives restarts and page reloads and
+    -- can be shown alongside the retained old table.  A new verified solve
+    -- (feasible or proven infeasible) clears both columns.
+    latest_solve_status     TEXT,
+    unverified_solve_json   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -108,11 +124,25 @@ class Store:
                     if "locked" not in str(exc) or attempt == _BUSY_ATTEMPTS - 1:
                         raise
             time.sleep(_BUSY_WAIT_SECONDS)
+        self._migrate_scenarios()
         # Backfill review baselines for batches that existed before the node
         # table.  Existing batches only get a single baseline node describing
         # the newest state knowable at upgrade time - earlier history is never
         # fabricated.  Idempotent and serialized via the write transaction.
         self._backfill_baselines()
+
+    @staticmethod
+    def _has_column(c, table: str, column: str) -> bool:
+        return any(r["name"] == column
+                   for r in c.execute(f"PRAGMA table_info({table})").fetchall())
+
+    def _migrate_scenarios(self) -> None:
+        """Add the solve-state columns to databases created before them."""
+        with self._write_tx() as c:
+            if not self._has_column(c, "scenarios", "latest_solve_status"):
+                c.execute("ALTER TABLE scenarios ADD COLUMN latest_solve_status TEXT")
+            if not self._has_column(c, "scenarios", "unverified_solve_json"):
+                c.execute("ALTER TABLE scenarios ADD COLUMN unverified_solve_json TEXT")
 
     @staticmethod
     def _snapshot(c, batch_id: int) -> str:
@@ -189,14 +219,43 @@ class Store:
 
     def save_result(self, scenario_id: int, result: dict, safety_radius: float,
                     safety_height: float, name: str | None = None) -> None:
+        """Persist a VERIFIED solve (feasible table or a proven infeasibility).
+
+        The unverified/unknown marker belongs to a previous run and is cleared
+        here, so the freshly proven result restores unmarked batch creation.
+        """
         with self._write_tx() as c:
             if name is not None:
                 c.execute("UPDATE scenarios SET name=? WHERE id=?", (name, scenario_id))
             c.execute(
-                "UPDATE scenarios SET result_json=?, solved_at=?, safety_radius=?, safety_height=?"
+                "UPDATE scenarios SET result_json=?, solved_at=?, safety_radius=?, "
+                "safety_height=?, latest_solve_status=NULL, unverified_solve_json=NULL"
                 " WHERE id=?",
                 (json.dumps(result, ensure_ascii=False), time.time(),
                  float(safety_radius), float(safety_height), scenario_id),
+            )
+
+    def rename_scenario(self, scenario_id: int, name: str) -> None:
+        """Rename a saved plan without touching solve state.
+
+        Renaming the retained old table must not lift the unverified marker.
+        """
+        with self._write_tx() as c:
+            c.execute("UPDATE scenarios SET name=? WHERE id=?", (name, scenario_id))
+
+    def mark_solve_unknown(self, scenario_id: int, attempted: dict) -> None:
+        """Record that the most recent solve came back ``unknown``.
+
+        The previously stored (old) table is never overwritten; only the
+        marker and the unproven run's attempted thresholds/locks are saved, so
+        the distinction survives restarts, reloads and renames.  A later
+        verified solve clears the marker via :meth:`save_result`.
+        """
+        with self._write_tx() as c:
+            c.execute(
+                "UPDATE scenarios SET latest_solve_status='unknown', "
+                "unverified_solve_json=? WHERE id=?",
+                (json.dumps(attempted, ensure_ascii=False), scenario_id),
             )
 
     def list_scenarios(self) -> list[dict]:
@@ -216,6 +275,9 @@ class Store:
         d = dict(row)
         d["input"] = json.loads(d.pop("input_json"))
         d["result"] = json.loads(d["result_json"]) if d.get("result_json") else None
+        d["unverified_solve"] = (
+            json.loads(d.pop("unverified_solve_json"))
+            if d.get("unverified_solve_json") else None)
         return d
 
     def delete_scenario(self, scenario_id: int) -> bool:
